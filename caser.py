@@ -31,7 +31,7 @@ Paper: Tang & Wang 2018 — "Personalized Top-N Sequential Recommendation via
         Convolutional Sequence Embedding"
 
 ─────────────────────────────────────────────────────────────────────────────
-Noam Shape Notation (shapes written as variable suffixes, dims separated by x)
+Noam Shape Notation  →  variablename_Dim1xDim2xDim3
 ─────────────────────────────────────────────────────────────────────────────
   B   = batch size
   L   = lookback window length (sequence)
@@ -44,10 +44,12 @@ Noam Shape Notation (shapes written as variable suffixes, dims separated by x)
   F   = flat feature dim (used after concatenation/pooling)
 """
 
+import einops
+import equinox as eqx
 import jax
 import jax.numpy as jnp
-import equinox as eqx
-import einops
+import optax
+
 from typing import List
 from jaxtyping import Float, Array, Int
 
@@ -81,26 +83,20 @@ class HorizontalConvBlock(eqx.Module):
             key=key,
         )
 
-    def __call__(self, img_x1xLxD: Float[Array, "1 L D"]) -> Float[Array, "Fh"]:
-        # img_x1xLxD — (1, L, D): single-channel image, L time steps, D features
-
+    def __call__(self, img_1xLxD: Float[Array, "1 L D"]) -> Float[Array, "Fh"]:
         # After valid conv with (h, D) kernel:
         #   height: L - h + 1 = Lh  (slides h-step window down L rows)
         #   width:  D - D + 1 = 1   (kernel spans full width, no slide)
         # → (Fh, Lh, 1)
-        out_xFhxLhx1 = self.conv(img_x1xLxD)
+        out_FhxLhx1 = self.conv(img_1xLxD)
 
         # Drop the trailing size-1 width dim → (Fh, Lh)
-        out_xFhxLh = einops.rearrange(out_xFhxLhx1, "fh lh 1 -> fh lh")
-
-        # ReLU: keep only positive activations (patterns that fired)
-        out_xFhxLh = jax.nn.relu(out_xFhxLh)
+        out_FhxLh = einops.rearrange(out_FhxLhx1, "fh lh 1 -> fh lh")
+        out_FhxLh = jax.nn.relu(out_FhxLh)
 
         # Global max-pool over Lh positions → (Fh,)
         # Picks the strongest activation across the window (where doesn't matter)
-        out_xFh = jnp.max(out_xFhxLh, axis=-1)
-
-        return out_xFh  # Fh
+        return jnp.max(out_FhxLh, axis=-1)  # Fh
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -108,29 +104,29 @@ class HorizontalConvBlock(eqx.Module):
 #
 # Architecture overview (single sample, no batch dim — use vmap for batching):
 #
-#   seq_xL (item ids)
-#     ──→ Q (embedding lookup) ──→ seq_emb_xLxD
-#         ──→ add channel dim   ──→ img_x1xLxD
+#   seq_L (item ids)
+#     ──→ Q (embedding lookup) ──→ seq_emb_LxD
+#         ──→ add channel dim   ──→ img_1xLxD
 #
 #   Vertical path (captures set-like co-occurrence across full window):
-#     img_x1xLxD  ──conv(L×1)──▶  out_xFvx1xD
-#                  ──ReLU──▶  out_xFvxD
-#                  ──flatten──▶  out_v_xF   (F = Fv×D)
+#     img_1xLxD  ──conv(L×1)──▶  out_Fvx1xD
+#                ──ReLU──▶  out_FvxD
+#                ──flatten──▶  out_v_F   (F = Fv×D)
 #
 #   Horizontal path (captures ordered sequential patterns):
-#     img_x1xLxD  ──[conv(h×D) + maxpool for h=1..L]──▶  [out_xFh, ...] each Fh
-#                  ──concat all heights──▶  out_h_xF   (F = Fh×L)
+#     img_1xLxD  ──[conv(h×D) + maxpool for h=1..L]──▶  [out_Fh, ...] each Fh
+#                ──concat all heights──▶  out_h_F   (F = Fh×L)
 #
 #   Short-term intent:
-#     concat(out_v_xF, out_h_xF)  ──dropout──▶  combined_xF
-#     combined_xF  ──Linear + ReLU──▶  z_xD      (short-term intent vector)
+#     concat(out_v_F, out_h_F)  ──dropout──▶  combined_F
+#     combined_F  ──Linear + ReLU──▶  z_D      (short-term intent vector)
 #
 #   Long-term taste:
-#     P(user_id)  ──▶  pu_xD
+#     P(user_id)  ──▶  pu_D
 #
 #   Scoring:
-#     x_x2D = concat(z_xD, pu_xD)
-#     score  = dot(x_x2D, Q_prime(item_id)) + b_item(item_id)
+#     x_2D = concat(z_D, pu_D)
+#     score = dot(x_2D, Q_prime(item_id)) + b_item(item_id)
 # ─────────────────────────────────────────────────────────────────────────────
 class CaserModel(eqx.Module):
     # ── Embedding tables ──────────────────────────────────────────────────────
@@ -218,7 +214,7 @@ class CaserModel(eqx.Module):
     def __call__(
         self,
         user_id:  Int[Array, ""],    # scalar user index
-        seq_xL:   Int[Array, "L"],   # L item ids (the lookback sequence)
+        seq_L:    Int[Array, "L"],   # L item ids (the lookback sequence)
         item_id:  Int[Array, ""],    # scalar target item index
         key:      jax.random.PRNGKey,
         training: bool = True,
@@ -230,62 +226,51 @@ class CaserModel(eqx.Module):
 
         # ── Step 1: Build the item-embedding "image" ───────────────────────────
         # Each item id in the sequence maps to a D-dim embedding row.
-        # The L rows stacked form an image of shape (L, D).
         # vmap applies self.Q (which takes a scalar) across the L positions.
-        seq_emb_xLxD = jax.vmap(self.Q)(seq_xL)  # L × D
+        seq_emb_LxD = jax.vmap(self.Q)(seq_L)  # L × D
 
-        # Conv2d in Equinox expects (in_channels, height, width).
-        # We treat the sequence as a single-channel image: (1, L, D).
-        img_x1xLxD = einops.rearrange(seq_emb_xLxD, "l d -> 1 l d")  # 1 × L × D
+        # Conv2d expects (in_channels, height, width) → treat as 1-channel image
+        img_1xLxD = einops.rearrange(seq_emb_LxD, "l d -> 1 l d")  # 1 × L × D
 
         # ── Step 2: Vertical conv path ─────────────────────────────────────────
-        # kernel (L, 1) spans the full time axis and one embedding column.
-        # Sliding across D columns: height output = L-L+1 = 1, width output = D.
-        # So: (Fv, 1, D) — one row per filter, D values across embedding dims.
-        out_xFvx1xD = self.conv_v(img_x1xLxD)                             # Fv × 1 × D
-
-        # Squeeze the size-1 height dim → (Fv, D)
-        out_xFvxD = einops.rearrange(out_xFvx1xD, "fv 1 d -> fv d")       # Fv × D
-        out_xFvxD = jax.nn.relu(out_xFvxD)
-
-        # Flatten to a single vector of length Fv*D for the FC layer
-        out_v_xF = einops.rearrange(out_xFvxD, "fv d -> (fv d)")          # Fv*D
+        # kernel (L, 1): height output = L-L+1 = 1, width output = D → (Fv, 1, D)
+        out_Fvx1xD = self.conv_v(img_1xLxD)                              # Fv × 1 × D
+        out_FvxD   = einops.rearrange(out_Fvx1xD, "fv 1 d -> fv d")     # Fv × D
+        out_FvxD   = jax.nn.relu(out_FvxD)
+        out_v_F    = einops.rearrange(out_FvxD, "fv d -> (fv d)")        # Fv*D
 
         # ── Step 3: Horizontal conv path (all heights) ─────────────────────────
         # For each height h, HorizontalConvBlock returns a vector of length Fh.
         # We get L such vectors (h = 1..L) and concatenate them → Fh*L.
-        h_outs = [block(img_x1xLxD) for block in self.conv_h_list]  # L × [Fh]
-        out_h_xF = jnp.concatenate(h_outs, axis=0)                  # Fh*L
+        out_h_F = jnp.concatenate(
+            [block(img_1xLxD) for block in self.conv_h_list], axis=0  # Fh*L
+        )
 
         # ── Step 4: Merge vertical + horizontal, project to intent vector ──────
-        combined_xF = jnp.concatenate([out_v_xF, out_h_xF], axis=0)  # Fv*D + Fh*L
+        combined_F = jnp.concatenate([out_v_F, out_h_F], axis=0)  # Fv*D + Fh*L
 
         # Dropout applied on the merged representation (as per the paper §3.2)
         key, subkey = jax.random.split(key)
-        combined_xF = self.dropout(combined_xF, key=subkey, inference=not training)
+        combined_F = self.dropout(combined_F, key=subkey, inference=not training)
 
         # Linear + ReLU → short-term intent z (size D)
-        # z captures "what does this user want right now given their recent history"
-        z_xD = jax.nn.relu(self.fc(combined_xF))  # D
+        z_D = jax.nn.relu(self.fc(combined_F))  # D
 
         # ── Step 5: Combine short-term intent z with long-term user taste P_u ──
         # P_u is a learned "standing preference" vector, independent of the sequence.
-        # Concatenating z and P_u gives a 2D vector that jointly represents
-        # both "what the user usually likes" and "what they want right now".
-        pu_xD = self.P(user_id)                          # D
-        x_x2D = jnp.concatenate([z_xD, pu_xD], axis=0)  # 2D
+        # Concatenating z and P_u gives a 2D vector representing both:
+        # "what the user usually likes" and "what they want right now".
+        pu_D  = self.P(user_id)                        # D
+        x_2D  = jnp.concatenate([z_D, pu_D], axis=0)  # 2D
 
         # ── Step 6: Score the target item ──────────────────────────────────────
         # Q_prime maps items to the *same 2D space* as x.
         # Score = dot(x, Q_prime_i) + b_i
-        # Higher score → model predicts item i is more likely to be clicked next.
-        qi_x2D = self.Q_prime(item_id)                                     # 2D
-        bi     = self.b_item(item_id)[0]                                   # scalar
+        qi_2D = self.Q_prime(item_id)  # 2D
+        bi    = self.b_item(item_id)[0]  # scalar
 
         # einsum "d,d->" = inner product of two 1D vectors → scalar
-        score = jnp.einsum("d,d->", x_x2D, qi_x2D) + bi  # scalar
-
-        return score
+        return jnp.einsum("d,d->", x_2D, qi_2D) + bi
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -296,22 +281,20 @@ class CaserModel(eqx.Module):
 # sample in the batch its own independent PRNG key for dropout.
 # ─────────────────────────────────────────────────────────────────────────────
 def batched_score(
-    model:       CaserModel,
-    user_id_xB:  Int[Array, "B"],
-    seq_xBxL:    Int[Array, "B L"],
-    item_id_xB:  Int[Array, "B"],
-    key:         jax.random.PRNGKey,
-    training:    bool = True,
+    model:      CaserModel,
+    user_id_B:  Int[Array, "B"],
+    seq_BxL:    Int[Array, "B L"],
+    item_id_B:  Int[Array, "B"],
+    key:        jax.random.PRNGKey,
+    training:   bool = True,
 ) -> Float[Array, "B"]:
     """Score a batch of (user, sequence, target_item) triples. Returns B scalars."""
     # Split into B independent keys so dropout differs across samples
-    keys_xB = jax.random.split(key, user_id_xB.shape[0])  # B × 2
+    keys_B = jax.random.split(key, user_id_B.shape[0])  # B × 2
 
-    scores_xB = jax.vmap(
-        lambda uid, seq, iid, k: model(uid, seq, iid, k, training)
-    )(user_id_xB, seq_xBxL, item_id_xB, keys_xB)
-
-    return scores_xB  # B
+    return jax.vmap(
+        lambda user_id, seq_L, item_id, key: model(user_id, seq_L, item_id, key, training)
+    )(user_id_B, seq_BxL, item_id_B, keys_B)  # B
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -334,10 +317,37 @@ def batched_score(
 #   When score_pos << score_neg: argument → -∞, log σ → -∞   (large loss)
 # ─────────────────────────────────────────────────────────────────────────────
 def bpr_loss(
-    pos_scores_xB: Float[Array, "B"],
-    neg_scores_xB: Float[Array, "B"],
+    pos_scores_B: Float[Array, "B"],
+    neg_scores_B: Float[Array, "B"],
 ) -> Float[Array, ""]:
-    return -jnp.mean(jax.nn.log_sigmoid(pos_scores_xB - neg_scores_xB))
+    # Step 1 — compute the score gap per sample:  shape [B]
+    #   A positive gap means the model already ranks pos above neg (good).
+    #   A negative gap means neg is ranked higher (bad, needs correction).
+    diff_B = pos_scores_B - neg_scores_B   # [B]
+
+    # Step 2 — why sigmoid (σ)?
+    #   We want to turn the raw score gap into a *probability*:
+    #       p(pos ranked above neg) = σ(diff)
+    #   σ maps any real number → (0, 1):
+    #       diff → +∞  ⟹  σ → 1   (model is confident and correct)
+    #       diff =  0  ⟹  σ = 0.5 (model is indifferent)
+    #       diff → -∞  ⟹  σ → 0   (model is confident but wrong)
+    #   Sigmoid is the natural choice here because BPR's derivation comes from
+    #   maximising the likelihood of pairwise orderings under a logistic model.
+
+    # Step 3 — why log?
+    #   We maximise log-likelihood (equivalent to minimising negative log-likelihood).
+    #   log σ(diff) is numerically much better than log(σ(diff)):
+    #     - When diff is large and positive, σ ≈ 1 and log(1) ≈ 0 (no gradient).
+    #       Computing log(σ(diff)) directly risks underflow; log_sigmoid uses the
+    #       identity log σ(x) = -log(1+e^{-x}) = -softplus(-x), which is stable.
+    #     - The gradient ∂/∂diff log σ(diff) = σ(-diff) ∈ (0,1), always finite.
+
+    # Step 4 — why negative mean?
+    #   log σ ≤ 0 always (since σ ≤ 1), so we want to *maximise* it.
+    #   Gradient descent *minimises*, so we negate: loss = -mean(log σ(diff)).
+    #   Taking the mean (not sum) keeps the loss scale independent of batch size B.
+    return -jnp.mean(jax.nn.log_sigmoid(diff_B))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -349,22 +359,21 @@ def bpr_loss(
 @eqx.filter_jit
 def train_step(
     model:      CaserModel,
-    optimizer:  "optax.GradientTransformation",
+    optimizer:  optax.GradientTransformation,
     opt_state,
-    user_id_xB: Int[Array, "B"],
-    seq_xBxL:   Int[Array, "B L"],
-    pos_id_xB:  Int[Array, "B"],   # positive (ground-truth) item ids
-    neg_id_xB:  Int[Array, "B"],   # negative (sampled)      item ids
+    user_id_B:  Int[Array, "B"],
+    seq_BxL:    Int[Array, "B L"],
+    pos_id_B:   Int[Array, "B"],   # positive (ground-truth) item ids
+    neg_id_B:   Int[Array, "B"],   # negative (sampled)      item ids
     key:        jax.random.PRNGKey,
 ):
-    import optax
-
     def loss_fn(model):
         # Use different keys for pos and neg scoring to keep dropout independent
         k1, k2 = jax.random.split(key)
-        pos_scores_xB = batched_score(model, user_id_xB, seq_xBxL, pos_id_xB, k1)
-        neg_scores_xB = batched_score(model, user_id_xB, seq_xBxL, neg_id_xB, k2)
-        return bpr_loss(pos_scores_xB, neg_scores_xB)
+        return bpr_loss(
+            batched_score(model, user_id_B, seq_BxL, pos_id_B, k1),
+            batched_score(model, user_id_B, seq_BxL, neg_id_B, k2),
+        )
 
     loss, grads = eqx.filter_value_and_grad(loss_fn)(model)
 
@@ -372,15 +381,13 @@ def train_step(
     updates, opt_state_new = optimizer.update(
         grads, opt_state, eqx.filter(model, eqx.is_array)
     )
-    model_new = eqx.apply_updates(model, updates)
-    return model_new, opt_state_new, loss
+    return eqx.apply_updates(model, updates), opt_state_new, loss
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Smoke test
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import optax
 
     B         = 32
     NUM_USERS = 100
@@ -401,12 +408,28 @@ if __name__ == "__main__":
         key=model_key,
     )
 
-    # Dummy batch
     key, data_key = jax.random.split(key)
-    user_id_xB = jax.random.randint(data_key, (B,),    0, NUM_USERS)
-    seq_xBxL   = jax.random.randint(data_key, (B, L),  0, NUM_ITEMS)
-    pos_id_xB  = jax.random.randint(data_key, (B,),    0, NUM_ITEMS)
-    neg_id_xB  = jax.random.randint(data_key, (B,),    0, NUM_ITEMS)
+    user_id_B = jax.random.randint(data_key, (B,),   0, NUM_USERS)
+    # BPR training requires (user, sequence, positive_item, negative_item) tuples.
+    #
+    # seq_BxL — the recent interaction history for each user: the L items they
+    #   engaged with just before the target item, ordered oldest→newest.  Shape
+    #   (B, L).  Caser treats this as a 2-D "image" (users × items) and applies
+    #   horizontal convolutions (capturing ordered sub-sequences) and vertical
+    #   convolutions (capturing item-level patterns across the whole window) over it.
+    #
+    # pos_id_B — the "ground-truth" next item each user actually interacted with
+    #   (clicked, bought, etc.).  In a real dataset this comes from the training
+    #   labels; here we sample random item ids to keep the smoke-test self-contained.
+    #
+    # neg_id_B — a *randomly sampled* item the user has NOT interacted with.
+    #   BPR does not need explicit dislikes; it just assumes unobserved items are
+    #   (probably) less relevant than the observed positive.  Uniform sampling from
+    #   all items is the simplest strategy — more sophisticated approaches sample
+    #   "hard negatives" that already score highly to speed up convergence.
+    seq_BxL   = jax.random.randint(data_key, (B, L), 0, NUM_ITEMS)
+    pos_id_B  = jax.random.randint(data_key, (B,),   0, NUM_ITEMS)
+    neg_id_B  = jax.random.randint(data_key, (B,),   0, NUM_ITEMS)
 
     optimizer = optax.adam(learning_rate=0.04)
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
@@ -414,13 +437,13 @@ if __name__ == "__main__":
     key, step_key = jax.random.split(key)
     model, opt_state, loss = train_step(
         model, optimizer, opt_state,
-        user_id_xB, seq_xBxL, pos_id_xB, neg_id_xB,
+        user_id_B, seq_BxL, pos_id_B, neg_id_B,
         step_key,
     )
     print(f"Loss after one step: {loss:.4f}")
 
     key, score_key = jax.random.split(key)
-    scores_xB = batched_score(model, user_id_xB, seq_xBxL, pos_id_xB, score_key, training=False)
-    assert scores_xB.shape == (B,), f"Expected ({B},), got {scores_xB.shape}"
-    print(f"Score shape : {scores_xB.shape}  ✓")
-    print(f"Score sample: {scores_xB[:3]}")
+    scores_B = batched_score(model, user_id_B, seq_BxL, pos_id_B, score_key, training=False)
+    assert scores_B.shape == (B,), f"Expected ({B},), got {scores_B.shape}"
+    print(f"Score shape : {scores_B.shape}  ✓")
+    print(f"Score sample: {scores_B[:3]}")
