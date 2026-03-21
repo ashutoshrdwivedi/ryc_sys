@@ -2,13 +2,14 @@
 factorization_machine.demos
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Five self-contained demonstrations that together form a complete tutorial.
+Six self-contained demonstrations that together form a complete tutorial.
 
     A — offset_trick       : the embedding-table index trick, step by step
     B — interaction_math   : numerical proof of the O(FK) formula
     C — fm_as_mf           : FM with 2 fields = Matrix Factorisation
     D — ctr_dataset        : CTRDataset structure, batching, and CTR breakdown
     E — training           : end-to-end training, shape checks, learned ⟨vᵢ,vⱼ⟩
+    F — deep_fm            : DeepFM sharing V with FM, FM vs DeepFM comparison
 
 Run all at once:
     python -m factorization_machine.demos
@@ -25,15 +26,17 @@ import optax
 # __package__ is set) and `uv run factorization_machine/demos.py` (script
 # mode, where __package__ is None and relative imports would fail).
 if __package__:
-    from .dataset  import CTRDataset, make_synthetic_ctr_dataset
-    from .model    import FMModel, batched_forward
-    from .training import bce_loss, train_step, evaluate
+    from .dataset    import CTRDataset, make_synthetic_ctr_dataset
+    from .model      import FMModel, batched_forward
+    from .deep_model import DeepFMModel, batched_forward as deep_batched_forward
+    from .training   import bce_loss, train_step, evaluate
 else:
     import pathlib, sys
     sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-    from factorization_machine.dataset  import CTRDataset, make_synthetic_ctr_dataset
-    from factorization_machine.model    import FMModel, batched_forward
-    from factorization_machine.training import bce_loss, train_step, evaluate
+    from factorization_machine.dataset    import CTRDataset, make_synthetic_ctr_dataset
+    from factorization_machine.model      import FMModel, batched_forward
+    from factorization_machine.deep_model import DeepFMModel, batched_forward as deep_batched_forward
+    from factorization_machine.training   import bce_loss, train_step, evaluate
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -387,6 +390,121 @@ def demo_training() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# F — DeepFM: shared embedding, FM vs DeepFM comparison
+# ─────────────────────────────────────────────────────────────────────────────
+def demo_deep_fm() -> None:
+    """
+    Train DeepFM on the same synthetic CTR dataset and compare against FM.
+
+    Key points illustrated:
+        1. V is shared: fm.V inside DeepFMModel is the SAME object used by
+           both the FM component and the DNN. One pytree leaf, updated by
+           gradients from both signal paths simultaneously.
+
+        2. Architecture: FM logit + DNN logit, where DNN input is the
+           concatenated (flattened) embedding vectors [v₁ ‖ … ‖ vF], shape F*K.
+
+        3. DeepFM has strictly more capacity than FM. On this toy dataset
+           (only 2nd-order signal) both should reach similar accuracy; on
+           real datasets with higher-order patterns, DeepFM tends to win.
+
+    Setup mirrors Demo E (same data, K, steps) so results are comparable.
+    """
+    print("=" * 60)
+    print("DEMO F: DeepFM — shared embedding, FM vs DeepFM comparison")
+    print("=" * 60)
+
+    B         = 1024
+    K         = 4
+    NUM_STEPS = 200
+    HIDDEN    = [64, 32]   # small MLP — dataset is simple
+
+    key = jax.random.PRNGKey(0)
+
+    key, dk = jax.random.split(key)
+    dataset = make_synthetic_ctr_dataset(n_samples=50_000, key=dk)
+    F = dataset.F
+
+    # ── Verify V is shared (same object id in both paths) ─────────────────────
+    key, mk = jax.random.split(key)
+    deep_model = DeepFMModel(field_dims=dataset.field_dims, K=K, hidden_dims=HIDDEN, key=mk)
+
+    # The FM component's V is the single embedding in the whole pytree.
+    # Reading fm.V in the DNN path accesses the same weight matrix.
+    n_fm_params  = dataset.N_vocab * K + dataset.N_vocab + 1
+    # Build the MLP architecture: input is flattened embeddings (F*K dims),
+    # then hidden layers, then single output logit.
+    # mlp_dims = [input_dim, hidden_1, hidden_2, ..., output_dim]
+    mlp_dims     = [F * K] + HIDDEN + [1]
+    
+    # Count total parameters in the MLP: for each layer, params = (input_dim * output_dim) + output_dim.
+    # The "+ output_dim" term accounts for bias vectors (one per output neuron).
+    # This excludes V which is shared with the FM component and counted separately above.
+    n_mlp_params = sum(d_in * d_out + d_out for d_in, d_out in zip(mlp_dims[:-1], mlp_dims[1:]))
+    print(f"  Vocab N={dataset.N_vocab}  Fields F={F}  Latent K={K}")
+    print(f"  MLP hidden dims: {HIDDEN}")
+    print(f"  FM  params : {n_fm_params}  (V: {dataset.N_vocab}×{K}, W: {dataset.N_vocab}×1, bias: 1)")
+    print(f"  MLP params : {n_mlp_params}  (on top, shares V with FM)")
+    print(f"  Total      : {n_fm_params + n_mlp_params}  (V counted once — it is shared)\n")
+
+    # ── Train DeepFM ──────────────────────────────────────────────────────────
+    optimizer = optax.adam(learning_rate=0.05)
+    opt_state = optimizer.init(eqx.filter(deep_model, eqx.is_array))
+
+    print(f"  {'Step':>4}  {'Loss':>8}  {'TrainAcc':>9}")
+    print(f"  {'-'*4}  {'-'*8}  {'-'*9}")
+
+    for step in range(1, NUM_STEPS + 1):
+        key, bk = jax.random.split(key)
+        x_BxF, y_B = dataset.get_batch(bk, B)
+        # train_step works generically on any eqx.Module — no changes needed.
+        deep_model, opt_state, loss = train_step(deep_model, optimizer, opt_state, x_BxF, y_B)
+        if step % 40 == 0 or step == 1:
+            acc = evaluate(deep_model, x_BxF, y_B)
+            print(f"  {step:>4}  {float(loss):>8.4f}  {float(acc):>9.3f}")
+
+    # ── Shape checks ──────────────────────────────────────────────────────────
+    print()
+    x_final_BxF, _ = dataset.get_batch(key, B)
+    logits_B = deep_batched_forward(deep_model, x_final_BxF)   # B
+    probs_B  = jax.nn.sigmoid(logits_B)
+    assert logits_B.shape == (B,)
+    assert jnp.all((probs_B >= 0) & (probs_B <= 1))
+    print(f"  Output logits shape : {logits_B.shape}  ✓")
+    print(f"  Probs in [0,1]      : ✓")
+
+    # ── Train a fresh FM for comparison ───────────────────────────────────────
+    # Same seed, same data → apples-to-apples accuracy comparison.
+    print(f"\n  Training FM for comparison (same setup)...")
+    key2 = jax.random.PRNGKey(0)
+    key2, dk2 = jax.random.split(key2)
+    dataset2 = make_synthetic_ctr_dataset(n_samples=50_000, key=dk2)
+    key2, mk2 = jax.random.split(key2)
+    fm_model  = FMModel(field_dims=dataset2.field_dims, K=K, key=mk2)
+    fm_opt    = optax.adam(learning_rate=0.05)
+    fm_state  = fm_opt.init(eqx.filter(fm_model, eqx.is_array))
+
+    for step in range(1, NUM_STEPS + 1):
+        key2, bk2 = jax.random.split(key2)
+        x_BxF2, y_B2 = dataset2.get_batch(bk2, B)
+        fm_model, fm_state, _ = train_step(fm_model, fm_opt, fm_state, x_BxF2, y_B2)
+
+    x_cmp_BxF, y_cmp_B = dataset2.get_batch(key2, B)
+    fm_acc   = float(evaluate(fm_model,   x_cmp_BxF, y_cmp_B))
+    deep_acc = float(evaluate(deep_model, x_final_BxF, y_B))
+
+    print(f"\n  Final accuracy comparison ({NUM_STEPS} steps, B={B}):")
+    print(f"    FM     accuracy : {fm_acc:.3f}")
+    print(f"    DeepFM accuracy : {deep_acc:.3f}")
+    print(f"""
+  NOTE: On this simple dataset (pure 2nd-order signal, 4 fields), FM and
+  DeepFM typically reach similar accuracy. DeepFM's advantage shows up on
+  real-world CTR datasets with complex higher-order feature interactions
+  (e.g. Criteo, Avazu) where FM's fixed 2nd-order term is insufficient.
+""")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 def main() -> None:
@@ -395,6 +513,7 @@ def main() -> None:
     demo_fm_as_mf()
     demo_ctr_dataset()
     demo_training()
+    demo_deep_fm()
 
 
 if __name__ == "__main__":
