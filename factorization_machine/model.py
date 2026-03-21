@@ -32,9 +32,15 @@ from typing import Sequence
 #              └──linear──┘   └────────── interaction ──────────────┘
 # ─────────────────────────────────────────────────────────────────────────────
 class FMModel(eqx.Module):
-    # V: latent factor embeddings, shape (N, K)
-    #    V[i] is the "interaction signature" of vocab entry i.
-    #    Two features interact with strength ⟨V[i], V[j]⟩.
+    # V: latent factor embedding table, shape (N, K)
+    #    WHY NOT store an interaction table directly?
+    #      A full N×N table of pairwise weights costs O(N²) params (N = total vocab size,
+    #      easily millions). Most pairs never appear in training data → no gradient → random weights.
+    #    WHAT WE DO INSTEAD (FM's key idea):
+    #      Give every vocab entry a small K-dim vector V[i]. The interaction weight between
+    #      features i and j is approximated as ⟨V[i], V[j]⟩ — a dot product, computed on the fly.
+    #      Cost: O(NK) params. Even unseen pairs get a meaningful weight because V[i] and V[j]
+    #      are each trained through other co-occurrences (generalisation via shared embeddings).
     # W: linear weights, shape (N, 1) — one scalar per vocab entry.
     # bias: global prior (analogous to overall CTR before any features).
     V:    eqx.nn.Embedding   # N × K
