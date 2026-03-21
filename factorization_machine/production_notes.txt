@@ -1,0 +1,244 @@
+DeepFM: Implementation vs Production
+======================================
+
+Our implementation is a faithful, readable version of the DeepFM paper
+(Guo et al. 2017). Here is what differs in production systems.
+
+
+1. Embedding Scale
+------------------
+Our N is tiny (15 entries). Production has billions of user/item IDs.
+Embeddings live on parameter servers or use hash tricks — collisions are
+tolerated in exchange for a fixed-size table that fits in memory.
+The full embedding table never fits on a single GPU.
+
+
+2. Multi-hot / Variable-length Fields
+--------------------------------------
+Each of our fields has exactly one active feature (one-hot). Production
+fields are often multi-hot: a user's watch history is a set of item IDs,
+not a single ID. The embedding for that field is a pooled aggregate —
+mean, sum, or attention-weighted — over the set. This changes the FM
+interaction computation significantly.
+
+
+3. Numerical Features
+---------------------
+We drop all numerical features. Production uses them (e.g. Criteo's 13
+numerical columns) via log-normalization and/or bucketing into learned
+bucket embeddings. These are a major CTR signal.
+
+
+4. MLP Architecture
+-------------------
+Our MLP is a minimal [F*K -> hidden -> 1]. Production typically adds:
+  - Batch normalization after each linear layer
+  - Dropout for regularization
+  - Much larger hidden dims (1024, 512, 256 is common vs our 64, 32)
+  - Sometimes layer normalization over embeddings before concatenation
+
+
+5. What Replaced DeepFM in SOTA
+---------------------------------
+DeepFM (2017) is now rarely the production model. It was quickly followed by:
+
+  DCN (Deep & Cross Network, 2017)
+    Replaces FM's 2nd-order term with an explicit cross network that models
+    bounded-degree feature interactions more efficiently.
+
+  DCN-V2 (2021)
+    Replaces the cross vector with a cross matrix. Widely used at Google.
+    https://arxiv.org/abs/2008.13535
+
+  AutoInt (2019)
+    Uses multi-head self-attention over field embeddings for interaction
+    modeling. Each head learns a different interaction pattern.
+    https://arxiv.org/abs/1810.11921
+
+  DLRM (Meta, 2019)
+    Architecture behind Meta's ad ranking. Separates dense and sparse
+    feature paths; uses dot-product interactions rather than FM.
+    https://arxiv.org/abs/1906.00091
+
+
+6. Serving Reality
+------------------
+Production models are typically split for latency reasons:
+  - User embeddings are precomputed offline and cached.
+  - Online inference only runs the MLP forward pass with the cached user
+    embedding + real-time context features (current page, time of day, etc.).
+  - The FM interaction term is often not recomputed online at all.
+
+
+7. The Full Recommendation Pipeline (System Design)
+----------------------------------------------------
+DeepFM is a *ranking* model. It sits in stage 2 of a multi-stage funnel:
+
+  Retrieval (candidate generation)
+    Reduces billions of items to ~hundreds of candidates in <10ms.
+    Typically a two-tower model: user embedding and item embedding trained
+    separately, similarity computed via dot product + approximate nearest
+    neighbour search (FAISS, ScaNN).
+    FM/DeepFM is NOT used here — too slow to score billions of items.
+
+  Ranking
+    Scores the ~hundreds of candidates with a heavy model (DeepFM, DCN-V2).
+    Has access to cross features (user x item interactions) which two-tower
+    cannot use. Runs on tens to hundreds of candidates, not billions.
+
+  Re-ranking
+    Applies business rules: diversity, freshness, deduplication, policy
+    constraints (e.g. no two ads from same advertiser back-to-back).
+    Sometimes a lightweight model, sometimes pure heuristics.
+
+  Knowing which stage a model belongs to, and why, is a core staff+ expectation.
+
+
+8. Training Data: Label Generation and Bias
+-------------------------------------------
+Labels are not clean.
+
+  Position bias
+    Items shown at the top of a feed get clicked more regardless of quality.
+    If you train naively on clicks, the model learns to rank what was already
+    ranked highly — a feedback loop. Fix: propensity weighting, position-aware
+    models, or randomised position experiments.
+
+  Selection bias
+    You only observe clicks on items that were shown. You have no signal on
+    items the model never retrieved. Exposure matters.
+
+  Delayed feedback
+    Conversions (purchases) happen hours or days after a click. Naive training
+    on a fixed window treats delayed positives as negatives. Fix: importance
+    weighting or streaming approaches (e.g. Meta's paper on delayed feedback).
+
+  Negative sampling
+    You can't train on all non-clicked impressions — too many. Strategies:
+      Random negatives: simple but easy for the model, poor hard-negative signal.
+      In-batch negatives: other items in the same batch serve as negatives
+        (used in two-tower retrieval). Introduces popularity bias.
+      Hard negatives: items the model almost retrieved but didn't — forces the
+        model to learn finer distinctions. Common in ranking.
+
+
+9. Metrics: What AUC Does and Does Not Tell You
+------------------------------------------------
+AUC (Area Under ROC Curve) is the standard offline metric for CTR models.
+It measures ranking ability: can the model rank clicked items above non-clicked?
+
+AUC does NOT measure:
+  - Calibration: a model with AUC=0.80 may output p=0.9 for 10% CTR items.
+    Calibrated probabilities are required for bid pricing in ads systems.
+    Fix: Platt scaling or isotonic regression post-hoc.
+
+  - Absolute CTR accuracy: AUC is invariant to monotone transformations of
+    the score, so a perfectly calibrated and a wildly miscalibrated model
+    can have identical AUC.
+
+  - Business metrics: AUC gains do not reliably predict revenue / engagement
+    lift. A 0.001 AUC gain may or may not move the needle online.
+    Always A/B test. The AUC-to-business-metric relationship is empirical.
+
+  Normalized Entropy (NE) is often preferred in ads: it measures how much
+  the model reduces uncertainty relative to a prior (the average CTR).
+  NE < 1 means the model is better than predicting the global average CTR.
+
+
+10. Training/Serving Skew
+--------------------------
+One of the most common production bugs. The model trains on feature values
+computed one way; at serving time the same features are computed differently.
+
+Common causes:
+  - Feature store lag: training uses batch-computed features, serving uses
+    a real-time approximation with a different join key or aggregation window.
+  - Preprocessing inconsistency: log(x+1) in training, log(x) at serving.
+  - Timestamp leakage: a feature that uses future information during training
+    (e.g. item's total click count includes clicks that happen after the
+    impression being predicted).
+
+Fix: feature stores with point-in-time correctness (e.g. Feast, Tecton),
+shared preprocessing code between training and serving pipelines.
+
+
+11. Cold Start
+--------------
+New users and new items have no history, so their embeddings are untrained.
+
+  User cold start: use demographic features, device type, referrer URL, or
+    the items they interact with in their first session as a proxy.
+
+  Item cold start: use content features (title embedding, category, price)
+    as a fallback until enough interaction data accumulates.
+
+  A common pattern: a content-based model runs in parallel with the
+  collaborative model; a gating mechanism blends the two based on how much
+  data exists for the entity.
+
+
+12. Multi-task Learning
+-----------------------
+Production ranking models rarely optimise for a single label. A typical
+ads model predicts:
+  - p(click)
+  - p(conversion | click)
+  - p(negative feedback)  (hide ad, report ad)
+
+Each task has its own output head on top of shared lower layers. The shared
+embedding learns a representation useful for all tasks simultaneously.
+Final score = weighted combination: e.g. CTR * CVR - lambda * neg_feedback.
+
+The weights are tuned to align with business objectives (revenue, engagement)
+and are often the subject of ongoing experimentation.
+
+
+13. Online / Continual Learning
+--------------------------------
+User interests shift intra-day (morning vs evening behaviour). A model
+trained on last week's data may already be stale.
+
+Approaches:
+  - Periodic retraining: retrain every few hours on a rolling window.
+    Simple but has a gap between data collection and model deployment.
+  - Online learning: update model weights continuously on a stream of events
+    (Kafka, Flink). Requires careful learning rate scheduling — a single
+    outlier batch should not destroy a well-trained model.
+  - Embedding-only updates: freeze the MLP, only update the embedding table
+    online. Much cheaper and surprisingly effective.
+
+
+14. Memorisation vs Generalisation (Wide & Deep framing)
+---------------------------------------------------------
+Google's Wide & Deep paper (Cheng 2016) — the predecessor to DeepFM —
+frames the ranking problem as two complementary needs:
+
+  Memorisation (wide part): explicitly cross features that are known to
+    matter (e.g. app_installed AND query_contains_game). The model memorises
+    these co-occurrences directly. Requires manual feature engineering.
+
+  Generalisation (deep part): learns to generalise to unseen feature
+    combinations via the embedding + MLP. No manual crossing needed.
+
+DeepFM's contribution was to replace the wide part's manual cross features
+with the FM's automatic 2nd-order interactions, removing hand-engineering
+while keeping the memorisation ability.
+
+Knowing this framing — and being able to say *when* to use each — is a
+common staff+ discussion point.
+
+
+Summary
+-------
+Our implementation correctly captures the paper's architecture and is the
+right starting point for understanding DeepFM. A production ads ranker at
+Meta or Google looks quite different:
+
+  Architecture  : DCN-V2 or DLRM variant, not vanilla DeepFM
+  Embeddings    : distributed, billions of entries, hash trick
+  Features      : multi-hot pooling, numerical features, real-time features
+  Training data : position-debiased, hard negatives, delayed feedback handling
+  Metrics       : AUC + NE + calibration, always followed by A/B test
+  Pipeline      : two-tower retrieval → deep ranking → re-ranking
+  Training infra: continual/online learning, feature store with point-in-time
+  Objective     : multi-task (click, conversion, negative feedback)
